@@ -3,7 +3,7 @@ const { readFile, writeFile, mkdir } = require("fs/promises");
 const path = require("path");
 
 const PORT = Number(process.env.PORT || 3021);
-const DB_FILE = path.join(__dirname, "data", "db.json");
+const DB_FILE = process.env.DB_FILE || path.join(__dirname, "data", "db.json");
 
 const initialData = {
   clocks: [
@@ -39,7 +39,8 @@ const initialData = {
       qualified: false,
       note: "仍偏快，振幅尚可"
     }
-  ]
+  ],
+  deliveries: []
 };
 
 const routes = [
@@ -51,8 +52,11 @@ const routes = [
   "POST /clocks/:id/adjustments",
   "POST /clocks/:id/retests",
   "GET /clocks/:id/latest-retest",
+  "POST /clocks/:id/deliveries",
+  "GET /clocks/:id/deliveries",
   "GET /adjustments",
-  "GET /retests"
+  "GET /retests",
+  "GET /deliveries"
 ];
 
 async function ensureDb() {
@@ -66,7 +70,9 @@ async function ensureDb() {
 
 async function readDb() {
   await ensureDb();
-  return JSON.parse(await readFile(DB_FILE, "utf8"));
+  const data = JSON.parse(await readFile(DB_FILE, "utf8"));
+  if (!Array.isArray(data.deliveries)) data.deliveries = [];
+  return data;
 }
 
 async function writeDb(data) {
@@ -115,25 +121,53 @@ function findClock(db, clockId) {
 }
 
 function latestRetest(db, clockId) {
-  return db.retests
-    .filter((item) => item.clockId === clockId)
-    .sort((a, b) => new Date(b.testedAt) - new Date(a.testedAt))[0] || null;
+  let latest = null;
+  for (const item of db.retests) {
+    if (item.clockId !== clockId) continue;
+    if (!latest || new Date(item.testedAt) >= new Date(latest.testedAt)) latest = item;
+  }
+  return latest;
 }
 
 function latestAdjustment(db, clockId) {
-  return db.adjustments
-    .filter((item) => item.clockId === clockId)
-    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt))[0] || null;
+  let latest = null;
+  for (const item of db.adjustments) {
+    if (item.clockId !== clockId) continue;
+    if (!latest || new Date(item.createdAt) >= new Date(latest.createdAt)) latest = item;
+  }
+  return latest;
 }
 
+// 复测是否属于当前（最新）调校轮次：优先按 adjustmentId 归属，历史无归属记录退化为时间比较
+function retestInRound(retest, adjustment) {
+  if (!retest || !adjustment) return false;
+  if (retest.adjustmentId) return retest.adjustmentId === adjustment.id;
+  return new Date(retest.testedAt) >= new Date(adjustment.createdAt);
+}
+
+function activeDelivery(db, clockId) {
+  return db.deliveries.find((item) => item.clockId === clockId && item.status === "active") || null;
+}
+
+// 交付状态机：pending_adjustment → pending_retest → awaiting_confirmation → delivered
+// 再次调校会使 active 交付失效，状态回到 pending_retest
 function clockSummary(db, clock) {
-  const retest = latestRetest(db, clock.id);
   const adjustment = latestAdjustment(db, clock.id);
+  const retest = latestRetest(db, clock.id);
+  const delivery = activeDelivery(db, clock.id);
+  // 达标判定必须限定在当前调校轮次，否则旧达标记录会让未复测钟表被误判为可取走
+  const roundQualified = Boolean(adjustment && retestInRound(retest, adjustment) && retest.qualified);
+  let deliveryStatus = "pending_adjustment";
+  if (delivery) deliveryStatus = "delivered";
+  else if (roundQualified) deliveryStatus = "awaiting_confirmation";
+  else if (adjustment) deliveryStatus = "pending_retest";
   return {
     ...clock,
     latestAdjustment: adjustment,
     latestRetest: retest,
-    qualified: retest ? retest.qualified : false
+    qualified: roundQualified,
+    deliveryStatus,
+    activeDelivery: delivery
   };
 }
 
@@ -148,10 +182,14 @@ async function handle(req, res) {
 
   if (req.method === "GET" && pathname === "/clocks") {
     const qualified = url.searchParams.get("qualified");
+    const deliveryStatus = url.searchParams.get("deliveryStatus");
     let data = db.clocks.map((clock) => clockSummary(db, clock));
     if (qualified !== null) {
       const expected = qualified === "true";
       data = data.filter((clock) => clock.qualified === expected);
+    }
+    if (deliveryStatus !== null) {
+      data = data.filter((clock) => clock.deliveryStatus === deliveryStatus);
     }
     return send(res, 200, { data });
   }
@@ -183,7 +221,16 @@ async function handle(req, res) {
     const clock = findClock(db, historyMatch[1]);
     const adjustments = db.adjustments.filter((item) => item.clockId === clock.id);
     const retests = db.retests.filter((item) => item.clockId === clock.id);
-    return send(res, 200, { data: { clock, adjustments, retests, latestRetest: latestRetest(db, clock.id) } });
+    const deliveries = db.deliveries.filter((item) => item.clockId === clock.id);
+    return send(res, 200, {
+      data: {
+        clock: clockSummary(db, clock),
+        adjustments,
+        retests,
+        deliveries,
+        latestRetest: latestRetest(db, clock.id)
+      }
+    });
   }
 
   const adjustmentMatch = pathname.match(/^\/clocks\/([^/]+)\/adjustments$/);
@@ -191,6 +238,7 @@ async function handle(req, res) {
     const clock = findClock(db, adjustmentMatch[1]);
     const body = await parseBody(req);
     required(body, ["currentDailyRateSeconds", "direction", "amount"]);
+    const now = new Date().toISOString();
     const adjustment = {
       id: makeId("adjustment"),
       clockId: clock.id,
@@ -198,11 +246,21 @@ async function handle(req, res) {
       direction: body.direction,
       amount: body.amount,
       note: body.note || "",
-      createdAt: new Date().toISOString()
+      createdAt: now
     };
     db.adjustments.push(adjustment);
+    // 再次调校：旧交付立刻失效（保留快照），钟表回到待复测
+    const invalidatedDeliveries = [];
+    for (const delivery of db.deliveries) {
+      if (delivery.clockId === clock.id && delivery.status === "active") {
+        delivery.status = "invalidated";
+        delivery.invalidatedAt = now;
+        delivery.invalidatedByAdjustmentId = adjustment.id;
+        invalidatedDeliveries.push(delivery);
+      }
+    }
     await writeDb(db);
-    return send(res, 201, { data: adjustment });
+    return send(res, 201, { data: adjustment, invalidatedDeliveries, clock: clockSummary(db, clock) });
   }
 
   const retestMatch = pathname.match(/^\/clocks\/([^/]+)\/retests$/);
@@ -235,6 +293,75 @@ async function handle(req, res) {
     return send(res, 200, { data: latestRetest(db, latestMatch[1]) });
   }
 
+  const deliveriesMatch = pathname.match(/^\/clocks\/([^/]+)\/deliveries$/);
+  if (deliveriesMatch && req.method === "GET") {
+    const clock = findClock(db, deliveriesMatch[1]);
+    const data = db.deliveries.filter((item) => item.clockId === clock.id);
+    return send(res, 200, { data });
+  }
+
+  // 交付确认复核：只有最新调校轮次的最新达标复测才能确认交付；
+  // 待复测 / 未达标 / 旧轮次记录 / 重复确认一律 409 且不落库
+  if (deliveriesMatch && req.method === "POST") {
+    const clock = findClock(db, deliveriesMatch[1]);
+    const body = await parseBody(req);
+    const adjustment = latestAdjustment(db, clock.id);
+    if (!adjustment) {
+      const error = new Error("钟表尚未调校，不能确认交付");
+      error.status = 409;
+      throw error;
+    }
+    const duplicated = db.deliveries.find(
+      (item) => item.clockId === clock.id && item.adjustmentId === adjustment.id && item.status === "active"
+    );
+    if (duplicated) {
+      const error = new Error("本轮调校已确认交付，请勿重复确认");
+      error.status = 409;
+      throw error;
+    }
+    let retest = null;
+    if (body.retestId) {
+      retest = db.retests.find((item) => item.id === body.retestId && item.clockId === clock.id) || null;
+      if (!retest) {
+        const error = new Error("复测记录不存在");
+        error.status = 404;
+        throw error;
+      }
+    } else {
+      retest = latestRetest(db, clock.id);
+    }
+    if (!retestInRound(retest, adjustment)) {
+      const error = new Error("钟表处于待复测状态：当前调校轮次缺少复测记录，不能确认交付");
+      error.status = 409;
+      throw error;
+    }
+    const latest = latestRetest(db, clock.id);
+    if (latest && retest.id !== latest.id) {
+      const error = new Error("只能使用最新的复测记录确认交付");
+      error.status = 409;
+      throw error;
+    }
+    if (!retest.qualified) {
+      const error = new Error("最新复测未达标，不能确认交付");
+      error.status = 409;
+      throw error;
+    }
+    const delivery = {
+      id: makeId("delivery"),
+      clockId: clock.id,
+      adjustmentId: adjustment.id,
+      retestId: retest.id,
+      status: "active",
+      confirmedAt: new Date().toISOString(),
+      invalidatedAt: null,
+      invalidatedByAdjustmentId: null,
+      note: body.note || ""
+    };
+    db.deliveries.push(delivery);
+    await writeDb(db);
+    return send(res, 201, { data: delivery, clock: clockSummary(db, clock) });
+  }
+
   if (req.method === "GET" && pathname === "/adjustments") {
     const clockId = url.searchParams.get("clockId");
     return send(res, 200, { data: db.adjustments.filter((item) => !clockId || item.clockId === clockId) });
@@ -247,6 +374,18 @@ async function handle(req, res) {
       const matchClock = !clockId || item.clockId === clockId;
       const matchQualified = qualified === null || item.qualified === (qualified === "true");
       return matchClock && matchQualified;
+    });
+    return send(res, 200, { data });
+  }
+
+  // 交付状态列表：与 /clocks/:id/deliveries、/clocks/:id/history 同源，保证一致
+  if (req.method === "GET" && pathname === "/deliveries") {
+    const clockId = url.searchParams.get("clockId");
+    const status = url.searchParams.get("status");
+    const data = db.deliveries.filter((item) => {
+      const matchClock = !clockId || item.clockId === clockId;
+      const matchStatus = !status || item.status === status;
+      return matchClock && matchStatus;
     });
     return send(res, 200, { data });
   }
